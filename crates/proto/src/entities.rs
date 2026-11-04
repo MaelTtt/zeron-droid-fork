@@ -1723,6 +1723,12 @@ pub enum AgentAuthKind {
 pub struct AgentAccountsSnapshot {
     pub accounts: Vec<AgentAccount>,
     pub warnings: Vec<AgentAccountWarning>,
+    /// Droid's custom models that spend another agent's plan than Factory's
+    /// (served from a Claude or ChatGPT subscription): model id → that agent
+    /// (Claude Code, Codex), whose own account row holds the usage. A custom
+    /// model absent here spends no plan; a built-in one spends Factory's.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub model_plans: std::collections::BTreeMap<String, HarnessId>,
 }
 
 /// A per-harness detection warning (e.g. Keychain denied reading the live login).

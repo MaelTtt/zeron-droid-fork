@@ -31,6 +31,13 @@ pub(crate) fn context(
             home.join(".fx/chatgpt-auth.json"),
             home.join(".fx/grok-auth.json"),
         ],
+        // The catalog follows the plan (auth), BYOK models in settings.json
+        // and the org's managed settings.
+        HarnessId::Droid => vec![
+            home.join(".factory/auth.v2.file"),
+            home.join(".factory/settings.json"),
+            home.join(".factory/org-managed-settings.cache.json"),
+        ],
         HarnessId::Opencode => {
             let data = root("XDG_DATA_HOME", home.join(".local/share"));
             let config = root("XDG_CONFIG_HOME", home.join(".config"));
@@ -114,6 +121,9 @@ pub(crate) fn context(
         HarnessId::Antigravity => &["GEMINI_", "GOOGLE_"],
         HarnessId::Cursor => &["CURSOR_"],
         HarnessId::Fx => &["FX_", "AI_GATEWAY_", "OPENAI_", "ANTHROPIC_"],
+        // Not `FACTORY_`: a Droid-launched shell exports per-session ids
+        // (`FACTORY_SESSION_ID`) that would churn the catalog on every launch.
+        HarnessId::Droid => &["FACTORY_API_"],
         _ => &[],
     };
     let mut env: Vec<_> = std::env::vars_os()
@@ -139,6 +149,24 @@ fn field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update((bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
 }
+/// Droid restamps `cachedAt` in its org-settings cache on every session start.
+/// Hashed raw, discovery's own launch would invalidate the context it is
+/// running under, so every attempt would be rejected as stale.
+fn stable_bytes(path: &Path, bytes: Vec<u8>) -> Vec<u8> {
+    if path
+        .file_name()
+        .is_some_and(|name| name == "org-managed-settings.cache.json")
+        && let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.remove("cachedAt");
+        if let Ok(stable) = serde_json::to_vec(&value) {
+            return stable;
+        }
+    }
+    bytes
+}
+
 fn hash_files<'a>(
     hash: &mut Sha256,
     files: impl Iterator<Item = &'a PathBuf>,
@@ -148,7 +176,7 @@ fn hash_files<'a>(
         match std::fs::read(path) {
             Ok(bytes) => {
                 hash.update([1]);
-                field(hash, &bytes);
+                field(hash, &stable_bytes(path, bytes));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => hash.update([0]),
             Err(e) => return Err(e.into()),
@@ -187,5 +215,33 @@ mod tests {
         assert!(!first.contains("account"));
         std::fs::remove_file(&file).unwrap();
         assert_eq!(key(), missing);
+    }
+
+    #[test]
+    fn droid_org_cache_ignores_its_refresh_stamp_but_not_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("org-managed-settings.cache.json");
+        let key = || {
+            let mut hash = Sha256::new();
+            hash_files(&mut hash, std::iter::once(&file)).unwrap();
+            format!("{:x}", hash.finalize())
+        };
+        let write = |blocked: &str, cached_at: u64| {
+            std::fs::write(
+                &file,
+                format!(
+                    r#"{{"orgId":"o","managedSettings":{{"modelPolicy":{{"blockedModelIds":["{blocked}"]}}}},"cachedAt":{cached_at}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write("model-a", 1);
+        let first = key();
+        write("model-a", 2);
+        assert_eq!(first, key());
+        write("model-b", 2);
+        assert_ne!(first, key());
+        std::fs::write(&file, "not json").unwrap();
+        assert_ne!(first, key());
     }
 }

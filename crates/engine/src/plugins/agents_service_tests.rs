@@ -55,6 +55,7 @@ fn fixture() -> Fixture {
     *lock(&host.snapshot) = zeron_proto::AgentAccountsSnapshot {
         accounts: vec![account("a1", true, 0.5), account("a2", false, 0.1)],
         warnings: vec![],
+        ..Default::default()
     };
     *lock(&host.chats) = vec![chat("c1", "opus")];
     plugins.agents().set_host(host.clone());

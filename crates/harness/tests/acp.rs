@@ -15,7 +15,7 @@ use zeron_harness::{
 };
 use zeron_proto::{
     AccessMode, AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel,
-    SteeringMode, TodoItem, TodoStatus, ToolCall, UserInputAnswer,
+    SteeringMode, TodoItem, TodoStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -871,6 +871,27 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
     assert!(devin.reasoning_levels().is_empty());
 
+    let droid = AcpHarness::droid();
+    assert_eq!(droid.id(), HarnessId::Droid);
+    assert_eq!(droid.display_name(), "Factory Droid");
+    assert!(droid.supports_steering());
+    assert_eq!(droid.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        droid.reasoning_levels(),
+        &[
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::Medium,
+            zeron_proto::ReasoningLevel::High,
+            zeron_proto::ReasoningLevel::XHigh,
+            zeron_proto::ReasoningLevel::Max,
+        ]
+    );
+    // Its `autonomy_level` has a mode that asks, so supervised is honored.
+    assert_eq!(
+        droid.access_modes(),
+        [AccessMode::Supervised, AccessMode::FullAccess]
+    );
+
     let hermes = AcpHarness::hermes();
     assert_eq!(hermes.id(), HarnessId::Hermes);
     assert_eq!(hermes.display_name(), "Hermes");
@@ -1504,6 +1525,145 @@ async fn devin_spec_drives_the_shared_acp_wire() {
         text: "Hello".into()
     }));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn droid_spec_drives_the_shared_acp_wire() {
+    let droid = AcpHarness::droid().with_executable(fixture_path());
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&droid, request("scenario:happy"), controls).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::SessionStarted { harness, .. } if *harness == HarnessId::Droid
+    )));
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "Hello".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+/// Controls answering the questions a run asks by their text, and the
+/// questions it was asked, in order.
+fn form_controls(
+    answers: &'static [(&'static str, &'static [&'static str])],
+) -> (
+    RunControls,
+    std::sync::Arc<std::sync::Mutex<Vec<UserInputQuestion>>>,
+) {
+    let (controls, _steer, _token) = controls();
+    let asked: std::sync::Arc<std::sync::Mutex<Vec<UserInputQuestion>>> = Default::default();
+    let record = asked.clone();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            record.lock().unwrap().extend(questions.iter().cloned());
+            let _ = tx.send(
+                questions
+                    .iter()
+                    .filter_map(|q| {
+                        let (_, labels) = answers.iter().find(|(text, _)| *text == q.question)?;
+                        Some(UserInputAnswer {
+                            question_id: q.id.clone(),
+                            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+                        })
+                    })
+                    .collect(),
+            );
+            rx
+        }),
+        ..controls
+    };
+    (controls, asked)
+}
+
+fn text_deltas(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn droid_ask_user_form_is_answered_through_the_input_bridge() {
+    // Droid's AskUser tool arrives as a form-mode `elicitation/create`. The
+    // fixture accepts only the exact content: Blue is `option_1`, Cheese is
+    // `option_0` and the typed Basil goes under `question_2_other`.
+    let droid = AcpHarness::droid().with_executable(fixture_path());
+    let (controls, asked) = form_controls(&[
+        ("Which color?", &["Blue"]),
+        ("Which toppings?", &["Cheese", "Basil"]),
+        ("Why?", &["because"]),
+    ]);
+    let events = run_to_end(&droid, request("scenario:elicit"), controls).await;
+
+    assert_eq!(
+        text_deltas(&events),
+        vec!["accepted".to_owned()],
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    let asked = asked.lock().unwrap().clone();
+    let summary: Vec<_> = asked
+        .iter()
+        .map(|q| {
+            (
+                q.header.as_str(),
+                q.question.as_str(),
+                q.options.clone(),
+                q.multi_select,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (
+                "Color",
+                "Which color?",
+                vec!["Red".to_owned(), "Blue".to_owned()],
+                false
+            ),
+            (
+                "Toppings",
+                "Which toppings?",
+                vec!["Cheese".to_owned(), "Olives".to_owned()],
+                true
+            ),
+            ("Reason", "Why?", Vec::new(), false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn droid_ask_user_form_the_person_closes_is_cancelled() {
+    let droid = AcpHarness::droid().with_executable(fixture_path());
+    let (controls, asked) = answering_controls(None);
+    let events = run_to_end(&droid, request("scenario:elicit"), controls).await;
+
+    assert_eq!(
+        text_deltas(&events),
+        vec!["cancelled".to_owned()],
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    assert_eq!(asked.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn only_droid_advertises_form_elicitation() {
+    // Another agent must not be offered forms it never asked for.
+    let (controls, asked) = answering_controls(Some("Yes"));
+    let events = run_to_end(&harness(), request("scenario:elicit"), controls).await;
+
+    assert_eq!(
+        text_deltas(&events),
+        vec!["no-form".to_owned()],
+        "{events:?}"
+    );
+    assert!(asked.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2636,6 +2796,7 @@ async fn mcp_injection_all_acp_harnesses_new_resume_and_fallback() {
     for harness in [
         AcpHarness::grok(),
         AcpHarness::devin(),
+        AcpHarness::droid(),
         AcpHarness::hermes(),
         AcpHarness::antigravity(),
     ] {
@@ -2686,6 +2847,7 @@ async fn mcp_injection_all_acp_harnesses_new_resume_and_fallback() {
 async fn all_acp_harnesses_use_project_scoped_session_command_updates() {
     for h in [
         AcpHarness::devin(),
+        AcpHarness::droid(),
         AcpHarness::grok(),
         AcpHarness::hermes(),
         AcpHarness::antigravity(),
@@ -2709,6 +2871,7 @@ async fn shared_acp_skills_require_explicit_native_command_classification() {
     use zeron_proto::invocation::{Invocation, harness_prompt};
     for h in [
         AcpHarness::devin(),
+        AcpHarness::droid(),
         AcpHarness::grok(),
         AcpHarness::hermes(),
         AcpHarness::antigravity(),

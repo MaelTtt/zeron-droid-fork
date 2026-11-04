@@ -2,7 +2,8 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
+//! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`), Factory
+//! Droid ([`AcpHarness::droid`], `droid exec --output-format acp`) and Hermes
 //! ([`AcpHarness::hermes`], `hermes acp`), fx ([`AcpHarness::fx`],
 //! `fx acp`) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
@@ -460,6 +461,80 @@ fn fx_install_paths() -> Vec<PathBuf> {
     crate::executable::home_dir()
         .map(|home| vec![home.join(".local/bin/fx")])
         .unwrap_or_default()
+}
+
+fn droid_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        paths.push(home.join(".local/bin/droid"));
+        paths.push(home.join(".factory/bin/droid"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/droid"));
+    paths.push(PathBuf::from("/usr/local/bin/droid"));
+    paths
+}
+
+fn droid_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Droid,
+        display_name: "Factory Droid",
+        executable: "droid",
+        env_override: "DROID_EXECUTABLE",
+        // The native ACP server Zed and JetBrains spawn. Model, effort and
+        // autonomy all arrive as session config options, never as flags.
+        args: &["exec", "--output-format", "acp"],
+        npm_package: None,
+        archive: None,
+        extra_paths: droid_install_paths,
+        cli_executable: "droid",
+        cli_extra_paths: droid_install_paths,
+        install_hint: "droid (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.factory/bin, /opt/homebrew/bin, and /usr/local/bin; install with \
+             `curl -fsSL https://app.factory.ai/cli | sh` or \
+             `brew install --cask droid`, then run `droid` once to sign in; set \
+             DROID_EXECUTABLE to override)",
+        // Fallback metadata only: discovery reads the live catalog, which
+        // follows the plan and any BYOK models. `auto` is the one id every
+        // plan advertises.
+        models: || {
+            vec![Model {
+                default: false,
+                id: "auto".into(),
+                label: "Auto Model".into(),
+                description: Some("Factory picks the model per request".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        // No `_session/steering` extension: steers wait for the turn's end.
+        steering_mode: SteeringMode::TurnBoundary,
+        // `reasoning_effort` is advertised as `thought_level`. Droid's own
+        // `none` has no Zeron level and stays the agent's default.
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: None,
+        stall_hint: "Run `droid` once to check it is signed in.",
+        effort_in_model_id: false,
+        // It advertises `device-pairing` and `factory-api-key`; neither is
+        // chosen for the user, who signs in with `droid` itself.
+        auth_method: None,
+        // Droid advertises its skills as slash commands itself.
+        skill_dirs: Vec::new,
+        hidden_commands: &[],
+        drops_unstarted_cancelled_prompt: false,
+        // Its `autonomy_level` mode: `normal` asks before anything but a
+        // read, `auto-high` approves on its own (see [`ASKING_MODES`]).
+        access_modes: &[AccessMode::Supervised, AccessMode::FullAccess],
+    }
 }
 
 fn hermes_install_paths() -> Vec<PathBuf> {
@@ -1729,6 +1804,12 @@ impl AcpHarness {
     /// fx native ACP server.
     pub fn fx() -> Self {
         Self::with_spec(fx_spec())
+    }
+
+    /// Factory Droid (`droid exec --output-format acp`) — Factory's native
+    /// ACP server.
+    pub fn droid() -> Self {
+        Self::with_spec(droid_spec())
     }
 
     /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
@@ -3526,6 +3607,14 @@ fn initialize_params(harness: HarnessId) -> Value {
         // separate subagentControl extension: Zeron has no matching UI yet.
         capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
     }
+    if harness == HarnessId::Droid {
+        // Droid's AskUser tool needs a client that can render a form: it
+        // sends `elicitation/create` only when `elicitation.form` is
+        // advertised, and otherwise cancels the tool at once (the turn then
+        // ends on "Tool execution cancelled by user"). Only `form`: `url`
+        // would make Droid route its own sign-in through the client.
+        capabilities["elicitation"] = json!({ "form": {} });
+    }
     // Grok gets no `_meta.clientType`, deliberately: naming a client type
     // that can show a prompt turns the actions its Auto-mode classifier
     // denies into permission requests, which zeron accepts like any other.
@@ -3801,7 +3890,7 @@ fn config_option_category<'a>(session_response: &'a Value, config_id: &str) -> O
 
 /// Session mode values that approve everything themselves, the agent's own
 /// full access.
-const NO_PROMPT_MODES: [&str; 7] = [
+const NO_PROMPT_MODES: [&str; 8] = [
     "bypassPermissions",
     "bypass_permissions",
     "bypass",
@@ -3809,11 +3898,14 @@ const NO_PROMPT_MODES: [&str; 7] = [
     "agent-full-access",
     "danger-full-access",
     "full-access",
+    // Factory Droid's highest `autonomy_level`.
+    "auto-high",
 ];
 
 /// Session mode values that ask before acting, for a run that is not in full
-/// access: Antigravity's `default` (its others are `auto_edit` and `yolo`).
-const ASKING_MODES: [&str; 1] = ["default"];
+/// access: Antigravity's `default` (its others are `auto_edit` and `yolo`)
+/// and Factory Droid's `normal` (its others are `spec` and `auto-*`).
+const ASKING_MODES: [&str; 2] = ["default", "normal"];
 
 /// The `session/set_config_option` calls a session response's `configOptions`
 /// warrant for this run:
@@ -4124,6 +4216,12 @@ fn handle_server_request(
             }
             Vec::new()
         }
+        // A form nobody can fill in (setup, a control call): the person
+        // never sees it, so it is cancelled rather than left unanswered.
+        "elicitation/create" => {
+            client.respond(&id, json!({ "action": "cancel" }));
+            Vec::new()
+        }
         _ => {
             tracing::debug!(target: "zeron_harness::acp", "unhandled server request: {method}");
             client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
@@ -4160,9 +4258,15 @@ fn is_user_question(options: &[Value]) -> bool {
 /// them here instead of leaving the agent waiting on a dialog nobody sees.
 #[derive(Default)]
 struct PendingQuestions {
-    /// Ids not yet answered; whoever removes an id answers it, exactly once.
-    unanswered: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    /// Ids not yet answered, each with the result that cancels it; whoever
+    /// removes an id answers it, exactly once.
+    unanswered: std::sync::Arc<std::sync::Mutex<Vec<(Value, Value)>>>,
     tasks: tokio::task::JoinSet<()>,
+}
+
+/// The result that cancels a pending `session/request_permission`.
+fn permission_cancelled() -> Value {
+    json!({ "outcome": { "outcome": "cancelled" } })
 }
 
 impl PendingQuestions {
@@ -4170,17 +4274,18 @@ impl PendingQuestions {
         &mut self,
         client: RpcClient,
         id: Value,
+        cancelled: Value,
         answer: impl std::future::Future<Output = Value> + Send + 'static,
     ) {
         while self.tasks.try_join_next().is_some() {}
-        self.lock().push(id.clone());
+        self.lock().push((id.clone(), cancelled));
         let unanswered = std::sync::Arc::clone(&self.unanswered);
         self.tasks.spawn(async move {
             let result = answer.await;
             let mut unanswered = unanswered
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(index) = unanswered.iter().position(|pending| *pending == id) {
+            if let Some(index) = unanswered.iter().position(|(pending, _)| *pending == id) {
                 unanswered.remove(index);
                 client.respond(&id, result);
             }
@@ -4190,12 +4295,12 @@ impl PendingQuestions {
     /// Answer every waiting question `cancelled` and drop its dialog.
     fn cancel_all(&mut self, client: &RpcClient) {
         self.tasks.abort_all();
-        for id in std::mem::take(&mut *self.lock()) {
-            client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } }));
+        for (id, cancelled) in std::mem::take(&mut *self.lock()) {
+            client.respond(&id, cancelled);
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Value>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(Value, Value)>> {
         self.unanswered
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4253,8 +4358,16 @@ fn handle_server_request_live(
         .and_then(Value::as_str)
         .is_some_and(|id| id != session_id)
     {
-        client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
+        let cancelled = if method == "elicitation/create" {
+            json!({ "action": "cancel" })
+        } else {
+            permission_cancelled()
+        };
+        client.respond(&id, cancelled);
         return Vec::new();
+    }
+    if method == "elicitation/create" {
+        return handle_elicitation_live(client, id, params, request_input, questions);
     }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -4270,7 +4383,7 @@ fn handle_server_request_live(
         }
         let question = permission::question(agent_name, params);
         let request_input = std::sync::Arc::clone(request_input);
-        questions.spawn(client.clone(), id, async move {
+        questions.spawn(client.clone(), id, permission_cancelled(), async move {
             let answers = (request_input)(vec![question.clone()])
                 .await
                 .unwrap_or_default();
@@ -4302,7 +4415,7 @@ fn handle_server_request_live(
         multi_select: false,
     };
     let request_input = std::sync::Arc::clone(request_input);
-    questions.spawn(client.clone(), id, async move {
+    questions.spawn(client.clone(), id, permission_cancelled(), async move {
         let answers = (request_input)(vec![question.clone()])
             .await
             .unwrap_or_default();
@@ -4323,6 +4436,206 @@ fn handle_server_request_live(
             None => json!({ "outcome": { "outcome": "cancelled" } }),
         }
     });
+    Vec::new()
+}
+
+/// One question of a form-mode `elicitation/create`, and how its answer goes
+/// back to the agent.
+#[derive(Debug, PartialEq)]
+struct ElicitedField {
+    /// The schema property the answer is filed under.
+    key: String,
+    /// `(const, title)` of each offered choice, `other` left out; empty for a
+    /// free-text question.
+    choices: Vec<(String, String)>,
+    /// Whether a typed answer may stand in for a choice, filed under
+    /// `{key}_other`.
+    has_other: bool,
+    multi: bool,
+}
+
+/// The questions an `elicitation/create` form asks of the person, and how
+/// each answer is filed. This reads the shape Droid's AskUser tool sends: a
+/// property per question (`question_1`, ...), a string with `oneOf` choices,
+/// an array of `anyOf` choices when several may be picked, or plain text when
+/// it has none, and an `other` choice typed into `{key}_other`. `None` for a
+/// form it cannot show, which the caller declines.
+fn elicitation_form(params: &Value) -> Option<(Vec<UserInputQuestion>, Vec<ElicitedField>)> {
+    if params
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode != "form")
+    {
+        return None;
+    }
+    let schema = params.get("requestedSchema")?;
+    let properties = schema.get("properties")?.as_object()?;
+    let keys: Vec<&str> = match schema.get("required").and_then(Value::as_array) {
+        Some(required) => required.iter().filter_map(Value::as_str).collect(),
+        None => {
+            let mut keys: Vec<&str> = properties
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !key.ends_with("_other"))
+                .collect();
+            // `question_2` before `question_10`.
+            keys.sort_by_key(|key| (key.len(), *key));
+            keys
+        }
+    };
+    if keys.is_empty() {
+        return None;
+    }
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("The agent needs your input.");
+    let mut asked = Vec::new();
+    let mut fields = Vec::new();
+    for key in keys {
+        let property = properties.get(key)?;
+        let multi = property.get("type").and_then(Value::as_str) == Some("array");
+        let offered = if multi {
+            property.get("items")?.get("anyOf")
+        } else {
+            property.get("oneOf")
+        };
+        let (choices, has_other) = match offered.and_then(Value::as_array) {
+            Some(entries) => {
+                let mut choices = Vec::new();
+                let mut has_other = false;
+                for entry in entries {
+                    let value = entry.get("const")?.as_str()?;
+                    let title = entry.get("title").and_then(Value::as_str).unwrap_or(value);
+                    if value == "other" {
+                        has_other = true;
+                    } else {
+                        choices.push((value.to_owned(), title.to_owned()));
+                    }
+                }
+                (choices, has_other)
+            }
+            None if !multi && property.get("type").and_then(Value::as_str) == Some("string") => {
+                (Vec::new(), false)
+            }
+            None => return None,
+        };
+        asked.push(UserInputQuestion {
+            id: new_message_id(),
+            header: property
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("Agent question")
+                .to_owned(),
+            question: property
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(message)
+                .to_owned(),
+            options: choices.iter().map(|(_, title)| title.clone()).collect(),
+            prefill: None,
+            multiline: false,
+            multi_select: multi,
+        });
+        fields.push(ElicitedField {
+            key: key.to_owned(),
+            choices,
+            has_other,
+            multi,
+        });
+    }
+    Some((asked, fields))
+}
+
+/// The `elicitation/create` result for the person's answers: `accept` with
+/// each answer filed as the form asked, or `cancel` when any question was
+/// left unanswered (the agent treats a partly filled form as cancelled too).
+/// A label that is not one of the choices is a typed answer.
+fn elicitation_result(
+    fields: &[ElicitedField],
+    asked: &[UserInputQuestion],
+    answers: &[UserInputAnswer],
+) -> Value {
+    let cancelled = || json!({ "action": "cancel" });
+    let mut content = serde_json::Map::new();
+    for (field, question) in fields.iter().zip(asked) {
+        let labels: Vec<&str> = answers
+            .iter()
+            .find(|answer| answer.question_id == question.id)
+            .map(|answer| {
+                answer
+                    .labels
+                    .iter()
+                    .map(|label| label.trim())
+                    .filter(|label| !label.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let labels = if field.multi {
+            &labels[..]
+        } else {
+            labels.get(..1).unwrap_or(&[])
+        };
+        if labels.is_empty() {
+            return cancelled();
+        }
+        if field.choices.is_empty() && !field.has_other {
+            content.insert(field.key.clone(), json!(labels[0]));
+            continue;
+        }
+        let mut picked: Vec<String> = Vec::new();
+        let mut typed: Vec<&str> = Vec::new();
+        for label in labels {
+            match field.choices.iter().find(|(_, title)| title == label) {
+                Some((value, _)) => {
+                    if !picked.contains(value) {
+                        picked.push(value.clone());
+                    }
+                }
+                None if field.has_other => typed.push(label),
+                None => return cancelled(),
+            }
+        }
+        if !typed.is_empty() {
+            picked.push("other".to_owned());
+            content.insert(format!("{}_other", field.key), json!(typed.join(", ")));
+        }
+        let value = if field.multi {
+            json!(picked)
+        } else {
+            json!(picked[0])
+        };
+        content.insert(field.key.clone(), value);
+    }
+    json!({ "action": "accept", "content": content })
+}
+
+/// A form-mode `elicitation/create` during a run (Droid's AskUser tool): the
+/// questions go to the person through the engine's input bridge, like any
+/// other question, and the answers go back as the form's content. A form it
+/// cannot show is declined; one the person closes (or a stopped run) is
+/// cancelled.
+fn handle_elicitation_live(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    questions: &mut PendingQuestions,
+) -> Vec<AgentEvent> {
+    let Some((asked, fields)) = elicitation_form(params) else {
+        client.respond(&id, json!({ "action": "decline" }));
+        return Vec::new();
+    };
+    let request_input = std::sync::Arc::clone(request_input);
+    questions.spawn(
+        client.clone(),
+        id,
+        json!({ "action": "cancel" }),
+        async move {
+            let answers = (request_input)(asked.clone()).await.unwrap_or_default();
+            elicitation_result(&fields, &asked, &answers)
+        },
+    );
     Vec::new()
 }
 
@@ -5123,7 +5436,10 @@ async fn select_session_config(
                 Err(e) => {
                     if matches!(
                         rules.harness,
-                        HarnessId::Antigravity | HarnessId::Devin | HarnessId::Fx
+                        HarnessId::Antigravity
+                            | HarnessId::Devin
+                            | HarnessId::Droid
+                            | HarnessId::Fx
                     ) && requested_model.is_some()
                         && is_model_config_option(&options_snapshot, &config_id)
                     {
@@ -7306,6 +7622,218 @@ mod tests {
     }
 
     #[test]
+    fn only_droid_initialize_advertises_form_elicitation() {
+        let droid = initialize_params(HarnessId::Droid);
+        assert_eq!(
+            droid["clientCapabilities"]["elicitation"],
+            json!({ "form": {} })
+        );
+        for harness in [HarnessId::Grok, HarnessId::Hermes, HarnessId::Devin] {
+            assert!(
+                initialize_params(harness)["clientCapabilities"]
+                    .get("elicitation")
+                    .is_none(),
+                "{harness:?}"
+            );
+        }
+    }
+
+    /// droid 1.3.0's AskUser form for one question with two options.
+    fn droid_form() -> Value {
+        json!({
+            "mode": "form",
+            "sessionId": "s",
+            "toolCallId": "call_1",
+            "message": "Droid needs your answers to continue.",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "question_1": {
+                        "type": "string",
+                        "title": "Color",
+                        "description": "Which color?",
+                        "oneOf": [
+                            { "const": "option_0", "title": "Red" },
+                            { "const": "option_1", "title": "Blue" },
+                            { "const": "other", "title": "Other answer" },
+                        ],
+                    },
+                    "question_1_other": { "type": "string", "title": "Color: Other answer" },
+                },
+                "required": ["question_1"],
+            },
+        })
+    }
+
+    #[test]
+    fn elicitation_form_reads_droids_ask_user_schema() {
+        let (asked, fields) = elicitation_form(&droid_form()).unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].header, "Color");
+        assert_eq!(asked[0].question, "Which color?");
+        assert_eq!(asked[0].options, ["Red", "Blue"]);
+        assert!(!asked[0].multi_select);
+        assert_eq!(
+            fields,
+            vec![ElicitedField {
+                key: "question_1".into(),
+                choices: vec![
+                    ("option_0".into(), "Red".into()),
+                    ("option_1".into(), "Blue".into()),
+                ],
+                has_other: true,
+                multi: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn elicitation_form_without_required_keeps_question_order() {
+        let text = |title: &str| json!({ "type": "string", "title": title });
+        let params = json!({
+            "mode": "form",
+            "requestedSchema": { "type": "object", "properties": {
+                "question_10": text("Ten"),
+                "question_2": text("Two"),
+                "question_1": text("One"),
+            } },
+        });
+        let (asked, _) = elicitation_form(&params).unwrap();
+        let headers: Vec<_> = asked.iter().map(|q| q.header.as_str()).collect();
+        assert_eq!(headers, ["One", "Two", "Ten"]);
+    }
+
+    #[test]
+    fn elicitation_form_declines_what_it_cannot_show() {
+        let mut url = droid_form();
+        url["mode"] = json!("url");
+        assert!(elicitation_form(&url).is_none());
+
+        let mut number = droid_form();
+        number["requestedSchema"]["properties"]["question_1"] =
+            json!({ "type": "number", "title": "Count" });
+        assert!(elicitation_form(&number).is_none());
+
+        let mut missing = droid_form();
+        missing["requestedSchema"]["required"] = json!(["question_9"]);
+        assert!(elicitation_form(&missing).is_none());
+
+        assert!(elicitation_form(&json!({ "mode": "form" })).is_none());
+    }
+
+    fn answered(asked: &[UserInputQuestion], labels: &[&[&str]]) -> Vec<UserInputAnswer> {
+        asked
+            .iter()
+            .zip(labels)
+            .map(|(question, labels)| UserInputAnswer {
+                question_id: question.id.clone(),
+                labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn elicitation_result_files_a_picked_choice_by_its_const() {
+        let (asked, fields) = elicitation_form(&droid_form()).unwrap();
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["Blue"]])),
+            json!({ "action": "accept", "content": { "question_1": "option_1" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_result_files_a_typed_answer_under_other() {
+        let (asked, fields) = elicitation_form(&droid_form()).unwrap();
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["Green"]])),
+            json!({ "action": "accept", "content": {
+                "question_1": "other",
+                "question_1_other": "Green",
+            } })
+        );
+    }
+
+    #[test]
+    fn elicitation_result_takes_several_choices_once_each_and_one_for_a_single() {
+        let mut params = droid_form();
+        params["requestedSchema"]["properties"]["question_1"] = json!({
+            "type": "array",
+            "title": "Toppings",
+            "description": "Which?",
+            "items": { "anyOf": [
+                { "const": "option_0", "title": "Cheese" },
+                { "const": "option_1", "title": "Olives" },
+                { "const": "other", "title": "Other answer" },
+            ] },
+        });
+        let (asked, fields) = elicitation_form(&params).unwrap();
+        assert!(asked[0].multi_select);
+        assert_eq!(
+            elicitation_result(
+                &fields,
+                &asked,
+                &answered(&asked, &[&["Olives", "Cheese", "Olives", "Basil", "Sage"]])
+            ),
+            json!({ "action": "accept", "content": {
+                "question_1": ["option_1", "option_0", "other"],
+                "question_1_other": "Basil, Sage",
+            } })
+        );
+
+        // A single-choice question keeps only the first label it is given.
+        let (asked, fields) = elicitation_form(&droid_form()).unwrap();
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["Red", "Blue"]])),
+            json!({ "action": "accept", "content": { "question_1": "option_0" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_result_files_free_text_as_a_plain_string() {
+        let params = json!({
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "question_1": {
+                    "type": "string", "title": "Why", "description": "Why?", "minLength": 1,
+                } },
+                "required": ["question_1"],
+            },
+        });
+        let (asked, fields) = elicitation_form(&params).unwrap();
+        assert!(asked[0].options.is_empty());
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["  because  "]])),
+            json!({ "action": "accept", "content": { "question_1": "because" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_result_cancels_an_unanswered_or_inexpressible_form() {
+        let cancelled = json!({ "action": "cancel" });
+        let (asked, fields) = elicitation_form(&droid_form()).unwrap();
+        // The person closed the dialog.
+        assert_eq!(elicitation_result(&fields, &asked, &[]), cancelled);
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["  "]])),
+            cancelled
+        );
+
+        // No `other` choice: a label that is not a choice has nowhere to go.
+        let mut closed = droid_form();
+        closed["requestedSchema"]["properties"]["question_1"]["oneOf"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        let (asked, fields) = elicitation_form(&closed).unwrap();
+        assert!(!fields[0].has_other);
+        assert_eq!(
+            elicitation_result(&fields, &asked, &answered(&asked, &[&["Green"]])),
+            cancelled
+        );
+    }
+
+    #[test]
     fn steering_capability_reads_initialize_meta() {
         assert!(steering_supported(&json!({
             "protocolVersion": 1,
@@ -7804,6 +8332,41 @@ mod tests {
             config_option_sets(&codex, None, &[], &no_opts, full),
             vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
+    }
+
+    #[test]
+    fn droid_autonomy_level_follows_the_access_mode() {
+        // droid 1.3.0's `session/new` config: a `mode` select opening on
+        // `normal`, which approves reads only.
+        let droid = |current: &str| {
+            json!({
+                "sessionId": "droid-1",
+                "configOptions": [{
+                    "id": "autonomy_level",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": current,
+                    "options": [
+                        { "value": "normal" },
+                        { "value": "spec" },
+                        { "value": "auto-low" },
+                        { "value": "auto-medium" },
+                        { "value": "auto-high" },
+                    ],
+                }],
+            })
+        };
+        let opts = serde_json::Map::new();
+        let sets = |current, access| config_option_sets(&droid(current), None, &[], &opts, access);
+        let level = |value: &str| vec![("autonomy_level".to_owned(), json!({ "value": value }))];
+        assert_eq!(sets("normal", AccessMode::FullAccess), level("auto-high"));
+        assert_eq!(sets("auto-high", AccessMode::FullAccess), Vec::new());
+        for access in [AccessMode::Supervised, AccessMode::AutoAcceptEdits] {
+            assert_eq!(sets("normal", access), Vec::new(), "{access:?}");
+            assert_eq!(sets("auto-high", access), level("normal"), "{access:?}");
+            assert_eq!(sets("auto-low", access), level("normal"), "{access:?}");
+            assert_eq!(sets("spec", access), level("normal"), "{access:?}");
+        }
     }
 
     #[test]

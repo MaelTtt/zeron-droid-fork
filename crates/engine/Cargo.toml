@@ -41,6 +41,9 @@ portable-pty.workspace = true
 base64 = "0.22"
 # Cloud runner identity: Ed25519 device key (already in the tree via rustls).
 ring = "0.17"
+# Factory Droid's credential store is AES-256-GCM (agent_accounts/droid.rs);
+# already in the tree via webrtc.
+aes-gcm = "0.10"
 toml = "0.8"
 libc.workspace = true
 gethostname.workspace = true

@@ -428,5 +428,6 @@ fn demo_accounts() -> AgentAccountsSnapshot {
     AgentAccountsSnapshot {
         accounts,
         warnings: Vec::new(),
+        ..Default::default()
     }
 }

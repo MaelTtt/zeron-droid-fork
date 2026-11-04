@@ -74,6 +74,8 @@ pub enum HarnessId {
     Cursor,
     /// Cognition's Devin agent, driven over ACP (`devin acp`).
     Devin,
+    /// Factory's Droid agent, driven over ACP (`droid exec --output-format acp`).
+    Droid,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
     /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
@@ -117,6 +119,7 @@ impl<'de> Deserialize<'de> for HarnessId {
                     "codex",
                     "cursor",
                     "devin",
+                    "droid",
                     "grok",
                     "hermes",
                     "fx",
@@ -135,11 +138,12 @@ impl<'de> Deserialize<'de> for HarnessId {
 impl HarnessId {
     /// Every built-in harness, in declaration order (a registry agent is
     /// one a device added: the engine's registry lists those).
-    pub const ALL: [HarnessId; 12] = [
+    pub const ALL: [HarnessId; 13] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
         HarnessId::Devin,
+        HarnessId::Droid,
         HarnessId::Grok,
         HarnessId::Hermes,
         HarnessId::Fx,
@@ -157,6 +161,7 @@ impl HarnessId {
             HarnessId::Codex => "codex",
             HarnessId::Cursor => "cursor",
             HarnessId::Devin => "devin",
+            HarnessId::Droid => "droid",
             HarnessId::Grok => "grok",
             HarnessId::Hermes => "hermes",
             HarnessId::Fx => "fx",
@@ -1338,6 +1343,15 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
+        );
+        // Chats saved by earlier Droid builds carry this slug.
+        assert_eq!(
+            serde_json::to_string(&HarnessId::Droid).unwrap(),
+            "\"droid\""
+        );
+        assert_eq!(
+            serde_json::from_str::<HarnessId>("\"droid\"").unwrap(),
+            HarnessId::Droid
         );
     }
 

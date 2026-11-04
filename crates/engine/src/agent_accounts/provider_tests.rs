@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::droid::*;
 use super::stores::*;
 use super::usage::*;
 use super::*;
@@ -40,6 +41,8 @@ type Handler = dyn Fn(&str, &str, &str) -> (u16, String) + Send + Sync;
 struct MockServer {
     base: String,
     hits: Arc<Mutex<Vec<String>>>,
+    /// Each request's raw head (request line and headers), lower-cased.
+    heads: Arc<Mutex<Vec<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
@@ -52,12 +55,15 @@ impl MockServer {
             .unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let hits: Arc<Mutex<Vec<String>>> = Arc::default();
+        let heads: Arc<Mutex<Vec<String>>> = Arc::default();
         let handler: Arc<Handler> = Arc::new(handler);
         let task_hits = hits.clone();
+        let task_heads = heads.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let handler = handler.clone();
                 let hits = task_hits.clone();
+                let heads = task_heads.clone();
                 tokio::spawn(async move {
                     let mut raw = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -90,6 +96,7 @@ impl MockServer {
                     let method = first.next().unwrap_or("").to_string();
                     let path = first.next().unwrap_or("").to_string();
                     lock(&hits).push(format!("{method} {path}"));
+                    lock(&heads).push(head.to_ascii_lowercase());
                     let (status, reply) = handler(&method, &path, &body);
                     let response = http_response(
                         &format!("{status} X"),
@@ -104,8 +111,14 @@ impl MockServer {
         Self {
             base,
             hits,
+            heads,
             _task: task,
         }
+    }
+
+    /// Every request head received so far (lower-cased).
+    fn heads(&self) -> Vec<String> {
+        lock(&self.heads).clone()
     }
 
     fn hits(&self, prefix: &str) -> usize {
@@ -140,6 +153,7 @@ fn mocked(base: &str) -> ProbeEndpoints {
         openai_auth: base.to_string(),
         openai_port: 0,
         nous_portal: base.to_string(),
+        factory_api: base.to_string(),
         allow_slot_refresh: true,
         allow_loopback_http: true,
     }
@@ -2023,12 +2037,18 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
     .await;
     let tmp = tempfile::tempdir().unwrap();
     let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
-    write(&config.codex_home.join("auth.json"), &codex_auth("ada@example.com", "acct-ada"));
+    write(
+        &config.codex_home.join("auth.json"),
+        &codex_auth("ada@example.com", "acct-ada"),
+    );
 
     // The probe loads the credits alongside the usage.
     let codex = rows(&accounts.list(true).await.unwrap(), HarnessId::Codex);
     assert_eq!(codex.len(), 1);
-    let credits = codex[0].codex_reset_credits.clone().expect("credits listed");
+    let credits = codex[0]
+        .codex_reset_credits
+        .clone()
+        .expect("credits listed");
     assert_eq!(credits.available_count, 2);
     assert_eq!(credits.credits[0].id, "credit-1");
     assert!((codex[0].usage_windows[0].used_fraction - 1.0).abs() < 1e-6);
@@ -2038,7 +2058,13 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
     // before it probes again.
     let (restarted, _) = accounts_with(tmp.path(), mocked(&server.base));
     let cold = rows(&restarted.list(false).await.unwrap(), HarnessId::Codex);
-    assert_eq!(cold[0].codex_reset_credits.as_ref().map(|c| c.available_count), Some(2));
+    assert_eq!(
+        cold[0]
+            .codex_reset_credits
+            .as_ref()
+            .map(|c| c.available_count),
+        Some(2)
+    );
 
     // Redeeming checks the account, then sends Codex's own request.
     let outcome = accounts
@@ -2057,17 +2083,404 @@ async fn codex_banked_resets_list_persist_and_redeem_against_the_mock() {
         .consume_codex_reset_credit(&account, "credit-2", "key-2")
         .await
         .unwrap_err();
-    assert!(refused.to_string().contains("different account"), "{refused}");
-    assert_eq!(server.hits("POST /backend-api/wham/rate-limit-reset-credits/consume"), 1);
+    assert!(
+        refused.to_string().contains("different account"),
+        "{refused}"
+    );
+    assert_eq!(
+        server.hits("POST /backend-api/wham/rate-limit-reset-credits/consume"),
+        1
+    );
     // ...and a fresh engine's probe shows no numbers for it.
     let fresh = tempfile::tempdir().unwrap();
     let (other, config) = accounts_with(fresh.path(), mocked(&server.base));
-    write(&config.codex_home.join("auth.json"), &codex_auth("ada@example.com", "acct-ada"));
+    write(
+        &config.codex_home.join("auth.json"),
+        &codex_auth("ada@example.com", "acct-ada"),
+    );
     let refused = rows(&other.list(true).await.unwrap(), HarnessId::Codex);
     assert!(refused[0].usage_windows.is_empty());
     assert!(refused[0].codex_reset_credits.is_none());
 
     // Nothing to redeem with: refused before any request.
-    assert!(accounts.consume_codex_reset_credit(&account, "", "key-3").await.is_err());
-    assert!(accounts.consume_codex_reset_credit("no-such-account", "credit-2", "key-4").await.is_err());
+    assert!(
+        accounts
+            .consume_codex_reset_credit(&account, "", "key-3")
+            .await
+            .is_err()
+    );
+    assert!(
+        accounts
+            .consume_codex_reset_credit("no-such-account", "credit-2", "key-4")
+            .await
+            .is_err()
+    );
+}
+
+// ── Factory Droid ───────────────────────────────────────────────────────────
+
+/// `creds` sealed the way Droid seals its stores: `iv:tag:ciphertext`,
+/// base64, AES-256-GCM with a 16-byte IV.
+fn seal_store(creds: &serde_json::Value, key: &[u8; 32]) -> String {
+    use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::aead::{Aead, KeyInit};
+    let iv = [7u8; 16];
+    let mut sealed =
+        aes_gcm::AesGcm::<aes_gcm::aes::Aes256, aes_gcm::aead::consts::U16>::new_from_slice(key)
+            .unwrap()
+            .encrypt(GenericArray::from_slice(&iv), creds.to_string().as_bytes())
+            .unwrap();
+    let tag = sealed.split_off(sealed.len() - 16);
+    format!(
+        "{}:{}:{}",
+        BASE64.encode(iv),
+        BASE64.encode(tag),
+        BASE64.encode(sealed)
+    )
+}
+
+const DROID_KEY: [u8; 32] = [42; 32];
+
+/// Droid's file store under `config.droid_home`: a WorkOS-style access token
+/// that expires `expires_in` seconds from now.
+fn write_droid_login(config: &AgentAccountsConfig, email: &str, token_tail: &str, expires_in: i64) {
+    let access = jwt(serde_json::json!({
+        "sub": "user_01ABC",
+        "org_id": "org_01XYZ",
+        "email": email,
+        "exp": Utc::now().timestamp() + expires_in,
+    })) + token_tail;
+    write(
+        &config.droid_home.join("auth.v2.key"),
+        &BASE64.encode(DROID_KEY),
+    );
+    write(
+        &config.droid_home.join("auth.v2.file"),
+        &seal_store(
+            &serde_json::json!({
+                "access_token": access,
+                "refresh_token": "never-used",
+                "active_organization_id": "org_01XYZ",
+            }),
+            &DROID_KEY,
+        ),
+    );
+}
+
+/// Factory's `/api/billing/limits` with Standard at `monthly`% and the
+/// weekly window already over.
+fn droid_limits(monthly: u32) -> String {
+    let ended = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    let later = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+    serde_json::json!({
+        "hasActiveSubscription": true,
+        "limits": {
+            "standard": {
+                "fiveHour": { "usedPercent": 40, "windowEnd": later },
+                "weekly": { "usedPercent": 90, "windowEnd": ended },
+                "monthly": { "usedPercent": monthly, "windowEnd": later },
+            },
+            "core": { "fiveHour": { "usedPercent": 1, "windowEnd": later } },
+        },
+    })
+    .to_string()
+}
+
+#[test]
+fn droid_stores_open_with_their_key_only() {
+    let creds = serde_json::json!({ "access_token": "a.b.c", "refresh_token": "r" });
+    let sealed = seal_store(&creds, &DROID_KEY);
+    assert_eq!(decrypt_store(&sealed, &DROID_KEY), Some(creds));
+    assert_eq!(decrypt_store(&sealed, &[1u8; 32]), None);
+    assert_eq!(decrypt_store(&sealed, &DROID_KEY[..16]), None);
+    // Not `iv:tag:ciphertext`, not base64, an IV of the usual 12 bytes.
+    assert_eq!(decrypt_store("", &DROID_KEY), None);
+    assert_eq!(decrypt_store("a:b", &DROID_KEY), None);
+    assert_eq!(decrypt_store("!!:!!:!!", &DROID_KEY), None);
+    let parts: Vec<&str> = sealed.split(':').collect();
+    let short_iv = format!("{}:{}:{}", BASE64.encode([7u8; 12]), parts[1], parts[2]);
+    assert_eq!(decrypt_store(&short_iv, &DROID_KEY), None);
+    assert_eq!(decrypt_store(&format!("{sealed}:extra"), &DROID_KEY), None);
+}
+
+#[test]
+fn a_droid_login_is_identified_by_its_token_never_by_a_key() {
+    let token = jwt(serde_json::json!({
+        "sub": "user_1", "org_id": "org_9", "email": "ada@example.com", "exp": 1_900_000_000,
+    }));
+    let login = DroidLogin::from_store(&serde_json::json!({ "access_token": token })).unwrap();
+    let slot = login.slot();
+    assert_eq!(slot.account_key, "user_1:org_9");
+    assert_eq!(slot.profile.email, "ada@example.com");
+    assert_eq!(slot.profile.auth_kind, AgentAuthKind::Oauth);
+    assert_eq!(slot.credentials["expires_at"], 1_900_000_000);
+    assert_eq!(slot.id, slot_id_for(HarnessId::Droid, "user_1:org_9"));
+    // An opaque token still gets a stable, if plain, identity.
+    let opaque = DroidLogin::from_store(&serde_json::json!({
+        "access_token": "opaque", "active_organization_id": "org_9",
+    }))
+    .unwrap();
+    assert_eq!(opaque.account_key, "org_9");
+    assert_eq!(opaque.slot().profile.email, "Factory account");
+    assert!(DroidLogin::from_store(&serde_json::json!({ "refresh_token": "r" })).is_none());
+
+    let keyed = DroidLogin::api_key("fk-secret-value").slot();
+    assert_eq!(keyed.profile.auth_kind, AgentAuthKind::ApiKey);
+    assert!(keyed.account_key.starts_with("key-"));
+    assert!(!keyed.account_key.contains("secret"));
+    assert!(!keyed.id.contains("secret"));
+    assert_eq!(keyed.credentials["expires_at"], serde_json::Value::Null);
+}
+
+#[test]
+fn only_the_windows_still_counting_are_shown() {
+    let now = Utc::now();
+    let window = |label: &str, ends_in_hours: Option<i64>| AgentUsageWindow {
+        label: label.into(),
+        used_fraction: 0.5,
+        resets_at: ends_in_hours.map(|h| now + chrono::Duration::hours(h)),
+    };
+    let kept = live_windows(
+        &[
+            window("Session", Some(-1)),
+            window("Week", Some(30)),
+            window("Month", None),
+        ],
+        now,
+    );
+    let labels: Vec<_> = kept.iter().map(|w| w.label.as_str()).collect();
+    assert_eq!(labels, ["Week", "Month"]);
+}
+
+#[tokio::test]
+async fn droids_login_lists_as_one_unswitchable_account_with_its_usage() {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", "/api/billing/limits") => (200, droid_limits(100)),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    // Nothing signed in: no row, no request.
+    assert!(rows(&accounts.list(true).await.unwrap(), HarnessId::Droid).is_empty());
+    assert_eq!(server.hits("GET /api/billing"), 0);
+
+    write_droid_login(&config, "ada@example.com", ".tail", 1_800);
+    let listed = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    let [droid] = listed.as_slice() else {
+        panic!("one row expected: {listed:?}");
+    };
+    assert_eq!(droid.email.as_deref(), Some("ada@example.com"));
+    assert!(droid.active && !droid.switchable);
+    assert_eq!(droid.saved_at, None);
+    assert_eq!(droid.auth_kind, Some(AgentAuthKind::Oauth));
+    // Standard's windows; the weekly one ended two hours ago.
+    let meters: Vec<_> = droid
+        .usage_windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used_fraction))
+        .collect();
+    assert_eq!(meters, [("Session", 0.4), ("Month", 1.0)]);
+    assert!(droid.usage_error.is_none());
+
+    // The token reached Factory, and only Factory, as a bearer.
+    let heads = server.heads();
+    assert_eq!(heads.len(), 1);
+    assert!(
+        heads[0].starts_with("get /api/billing/limits "),
+        "{}",
+        heads[0]
+    );
+    assert!(
+        heads[0].contains("authorization: bearer e30."),
+        "{}",
+        heads[0]
+    );
+    assert!(heads[0].contains(".tail\r\n"), "{}", heads[0]);
+
+    // A second forced list inside the throttle, and a plain one, are served
+    // from the cache; so is a restarted engine.
+    let again = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(again[0].usage_windows, droid.usage_windows);
+    let plain = rows(&accounts.list(false).await.unwrap(), HarnessId::Droid);
+    assert_eq!(plain[0].usage_windows, droid.usage_windows);
+    let (restarted, _) = accounts_with(tmp.path(), mocked(&server.base));
+    let cold = rows(&restarted.list(false).await.unwrap(), HarnessId::Droid);
+    assert_eq!(cold[0].usage_windows, droid.usage_windows);
+    assert_eq!(server.hits("GET /api/billing"), 1);
+
+    // Nothing of the login lands in zeron's own store.
+    let saved = std::fs::read_dir(config.root_dir().join("droid")).ok();
+    assert!(saved.is_none(), "droid must not get slot files");
+    let cache = std::fs::read_to_string(config.usage_cache_file()).unwrap();
+    assert!(
+        !cache.contains("never-used") && !cache.contains(".tail"),
+        "{cache}"
+    );
+
+    // Droid's own login is not ours to switch or remove.
+    let id = droid.id.clone();
+    assert!(accounts.activate(HarnessId::Droid, &id).await.is_err());
+    assert!(accounts.forget(HarnessId::Droid, &id).await.is_err());
+    assert_eq!(
+        rows(&accounts.list(false).await.unwrap(), HarnessId::Droid).len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_expired_droid_token_is_not_sent_and_says_when_it_renews() {
+    let server = MockServer::start(|_, _, _| (200, droid_limits(10))).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    write_droid_login(&config, "ada@example.com", "", -60);
+    let listed = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(server.hits("GET"), 0);
+    assert!(listed[0].usage_windows.is_empty());
+    assert_eq!(
+        listed[0].usage_error.as_deref(),
+        Some("Session expired — it refreshes the next time droid runs")
+    );
+
+    // Droid renews its store: the very next forced list probes with it,
+    // without waiting out the expired token's backoff.
+    write_droid_login(&config, "ada@example.com", ".renewed", 1_800);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // `checked_at` throttles re-probes to once per 30s; age it.
+    {
+        let mut usage = lock(&accounts.inner.usage);
+        for entry in usage.values_mut() {
+            entry.checked_at -= 60_000;
+        }
+    }
+    let renewed = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(server.hits("GET /api/billing/limits"), 1);
+    assert_eq!(
+        renewed[0].usage_windows.len(),
+        3 - 1 /* weekly ended */
+    );
+    assert!(renewed[0].usage_error.is_none());
+}
+
+#[tokio::test]
+async fn droids_usage_failures_name_their_reason_and_keep_the_last_meters() {
+    let answer = Arc::new(Mutex::new((200u16, droid_limits(55))));
+    let handler_answer = answer.clone();
+    let server = MockServer::start(move |_, _, _| lock(&handler_answer).clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    write_droid_login(&config, "ada@example.com", "", 1_800);
+    let first = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(first[0].usage_windows.len(), 2);
+
+    let age = |accounts: &AgentAccounts| {
+        let mut usage = lock(&accounts.inner.usage);
+        for entry in usage.values_mut() {
+            entry.checked_at -= 60_000;
+            entry.retry_at = None;
+        }
+    };
+    // Factory rejects the token: the reason shows, the meters stay.
+    *lock(&answer) = (401, String::new());
+    age(&accounts);
+    let rejected = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(
+        rejected[0].usage_error.as_deref(),
+        Some("Session expired — it refreshes the next time droid runs")
+    );
+    assert_eq!(rejected[0].usage_windows, first[0].usage_windows);
+
+    // An account with no plan has no limits to show.
+    *lock(&answer) = (200, r#"{"hasActiveSubscription":false}"#.into());
+    age(&accounts);
+    let no_plan = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(
+        no_plan[0].usage_error.as_deref(),
+        Some("No active Factory plan")
+    );
+
+    // A reply that isn't the limits at all is schema drift.
+    *lock(&answer) = (200, r#"{"unexpected":true}"#.into());
+    age(&accounts);
+    let drifted = rows(&accounts.list(true).await.unwrap(), HarnessId::Droid);
+    assert_eq!(
+        drifted[0].usage_error.as_deref(),
+        Some("Usage format changed — update zeron")
+    );
+}
+
+// ── Droid's custom models on a subscription ─────────────────────────────────
+
+fn custom_model(id: &str, provider: &str, base_url: &str) -> serde_json::Value {
+    serde_json::json!({ "id": id, "provider": provider, "baseUrl": base_url, "apiKey": "x" })
+}
+
+#[test]
+fn a_custom_model_spends_a_plan_only_when_served_from_this_machine() {
+    let plan = |provider, base_url| model_plan(&custom_model("custom:m-0", provider, base_url));
+    let claude = Some(("custom:m-0".to_string(), HarnessId::ClaudeCode));
+    let codex = Some(("custom:m-0".to_string(), HarnessId::Codex));
+    assert_eq!(plan("anthropic", "http://127.0.0.1:8317"), claude);
+    assert_eq!(plan("anthropic", "http://localhost:4000/anthropic"), claude);
+    assert_eq!(plan("openai", "http://127.0.0.1:8317/v1"), codex);
+    assert_eq!(plan("openai", "http://[::1]:8317/v1"), codex);
+    // An API-billed endpoint spends no plan; neither does a local server of
+    // another kind, or a model with no usable address.
+    assert_eq!(plan("anthropic", "https://api.anthropic.com"), None);
+    assert_eq!(plan("openai", "https://api.openai.com/v1"), None);
+    assert_eq!(plan("anthropic", "http://evil.example:8317"), None);
+    assert_eq!(
+        plan("generic-chat-completion-api", "http://127.0.0.1:8080/v1"),
+        None
+    );
+    assert_eq!(plan("anthropic", "not a url"), None);
+    assert_eq!(
+        model_plan(&serde_json::json!({ "provider": "anthropic" })),
+        None
+    );
+}
+
+#[tokio::test]
+async fn droid_maps_its_custom_models_to_the_agent_plan_they_spend() {
+    let server = MockServer::start(|method, path, _| match (method, path) {
+        ("GET", "/api/billing/limits") => (200, droid_limits(100)),
+        _ => (404, String::new()),
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (accounts, config) = accounts_with(tmp.path(), mocked(&server.base));
+    write_droid_login(&config, "ada@example.com", "", 1_800);
+    let settings = config.droid_home.join("settings.json");
+
+    // No settings: nothing is mapped.
+    assert!(accounts.list(true).await.unwrap().model_plans.is_empty());
+
+    write(
+        &settings,
+        &serde_json::json!({ "customModels": [
+            custom_model("custom:Claude-Opus-0", "anthropic", "http://127.0.0.1:8317"),
+            custom_model("custom:gpt-5-0", "openai", "http://127.0.0.1:8317/v1"),
+            custom_model("custom:Claude-Api-0", "anthropic", "https://api.anthropic.com"),
+            custom_model("custom:Local-0", "generic-chat-completion-api", "http://127.0.0.1:8080/v1"),
+        ] })
+        .to_string(),
+    );
+    let snapshot = accounts.list(false).await.unwrap();
+    assert_eq!(
+        snapshot.model_plans.into_iter().collect::<Vec<_>>(),
+        [
+            ("custom:Claude-Opus-0".to_string(), HarnessId::ClaudeCode),
+            ("custom:gpt-5-0".to_string(), HarnessId::Codex),
+        ]
+    );
+
+    // Those plans are read from their own agents, never copied here: Droid
+    // still lists, and asks about, Factory's plan alone.
+    let snapshot = accounts.list(true).await.unwrap();
+    assert_eq!(rows(&snapshot, HarnessId::Droid).len(), 1);
+    assert_eq!(server.hits("GET /api/billing/limits"), 1);
+
+    // A settings file that is not JSON maps nothing.
+    write(&settings, "{ not json");
+    assert!(accounts.list(false).await.unwrap().model_plans.is_empty());
 }

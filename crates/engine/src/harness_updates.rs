@@ -496,6 +496,14 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "curl -fsSL https://fx.sh/setup.sh | bash",
         },
+        // `droid update --check` prints no version, and nothing at all when
+        // the install manages its own updates, so there is nothing to poll.
+        HarnessId::Droid => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Manual,
+            update_args: None,
+            manual_command: "droid update",
+        },
         HarnessId::Hermes => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Hermes,
