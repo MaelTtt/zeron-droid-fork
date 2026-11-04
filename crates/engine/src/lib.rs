@@ -398,7 +398,11 @@ impl EngineCore {
             agent_accounts_config.codex_home.clone()
         };
         sessions.set_generated_images(uploads.clone(), codex_home.join("generated_images"));
-        let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
+        // A pinned dev identity (`ZERON_EDGE_TOKEN`) keeps its chats under
+        // `orgs/<org>/<user>`, so an engine started without the pin opens
+        // `profiles/local` and writes there. Offering the import to that
+        // profile too is how those chats are carried back.
+        let local_import = (profile.scope() != WorkspaceScope::Local).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
                 &device_id,
