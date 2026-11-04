@@ -242,6 +242,42 @@ async fn import_without_local_profile_is_a_clean_no_op() {
     synced.shutdown().await;
 }
 
+/// An engine started without its pinned dev identity falls back to the local
+/// profile; chats made there must be importable into the pinned profile once
+/// the pin is back, or they vanish from the list.
+#[tokio::test]
+async fn local_work_imports_into_a_pinned_dev_profile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_device, chat_doc, chat_bare) = seed_local(dir.path()).await;
+
+    let pinned = assemble(EngineProfile::development(dir.path(), "local", "local"));
+    let status = pinned
+        .local_import
+        .as_ref()
+        .expect("a pinned dev profile offers the import")
+        .status()
+        .expect("status");
+    assert_eq!((status.available_chats, status.available_spaces), (2, 1));
+
+    let events = run_import(&pinned);
+    assert_eq!(summary(&events), (2, 1, 0, 0));
+    for id in [&chat_doc, &chat_bare] {
+        assert!(pinned.workspace.chat(id).expect("read chat").is_some());
+    }
+    assert!(
+        dir.path()
+            .join("orgs")
+            .join("local")
+            .join("local")
+            .join("journals")
+            .is_dir()
+    );
+    // The local profile's attachments stay readable after a restart.
+    assert!(marker_grants_read_root(dir.path(), "local", "local").is_some());
+
+    pinned.shutdown().await;
+}
+
 /// Read the summary WITHOUT asserting a clean run (the failure-injection tests
 /// need the errors).
 fn raw_summary(events: &[ImportEvent]) -> (usize, usize, Vec<String>) {
