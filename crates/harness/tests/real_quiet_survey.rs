@@ -204,6 +204,7 @@ async fn real_all_harnesses_quiet_survey() {
         .unwrap_or(3);
     let agents: Vec<(&str, fn() -> Box<dyn Harness>)> = vec![
         ("devin", || Box::new(AcpHarness::devin())),
+        ("droid", || Box::new(AcpHarness::droid())),
         ("grok", || Box::new(AcpHarness::grok())),
         ("hermes", || Box::new(AcpHarness::hermes())),
         ("pi", || Box::new(zeron_harness::PiHarness::new())),

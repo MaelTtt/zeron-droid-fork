@@ -13690,6 +13690,7 @@ dependencies = [
 name = "zeron-engine"
 version = "0.2.136"
 dependencies = [
+ "aes-gcm",
  "alacritty_terminal",
  "anyhow",
  "async-trait",

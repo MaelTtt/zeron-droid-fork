@@ -227,6 +227,7 @@ icon_assets![
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
     (DEVIN_MARK, "devin-mark"),
+    (DROID_MARK, "droid-mark"),
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (FX_MARK, "fx-mark"),

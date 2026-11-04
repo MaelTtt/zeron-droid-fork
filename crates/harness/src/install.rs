@@ -47,6 +47,7 @@ enum Method {
 // https://docs.x.ai/developers/release-notes and https://docs.x.ai/build/enterprise
 // https://hermes-agent.nousresearch.com/docs/getting-started/installation
 // https://cli.devin.ai/
+// https://docs.factory.ai/cli/getting-started/quickstart
 fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
     use HarnessId::*;
     use Method::*;
@@ -57,6 +58,8 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
         Mock | Registry(_) => vec![],
         Fx if windows => vec![],
         Fx => vec![Shell("curl -fsSL https://fx.sh/setup.sh | bash", "bash")],
+        Droid if windows => vec![PowerShell("irm https://app.factory.ai/cli/windows | iex")],
+        Droid => vec![Shell("curl -fsSL https://app.factory.ai/cli | sh", "sh")],
         Antigravity => vec![Archive],
         Muse if windows => vec![PowerShell("irm https://dev.meta.ai/install.ps1 | iex")],
         Muse => vec![Shell("curl -fsSL https://dev.meta.ai/install.sh | sh", "sh")],
@@ -166,6 +169,7 @@ pub fn manual_command(id: HarnessId) -> Option<&'static str> {
         Devin => "curl -fsSL https://cli.devin.ai/install.sh | bash",
         Muse => "curl -fsSL https://dev.meta.ai/install.sh | sh",
         Fx => "curl -fsSL https://fx.sh/setup.sh | bash",
+        Droid => "curl -fsSL https://app.factory.ai/cli | sh",
         Antigravity | Mock | Registry(_) => return None,
     })
 }
@@ -185,6 +189,7 @@ fn cli_and_dir(id: HarnessId) -> (&'static str, &'static str) {
         Muse => ("muse", "~/.local/bin"),
         Mock => ("mock", "PATH"),
         Fx => ("fx", "~/.local/bin"),
+        Droid => ("droid", "~/.local/bin or ~/.factory/bin"),
         Registry(agent) => (agent.registry_id(), "~/.zeron/agents"),
     }
 }
@@ -204,6 +209,7 @@ pub fn installed(id: HarnessId) -> bool {
         Muse => crate::MuseHarness::new().installed(),
         Mock => false,
         Fx => crate::AcpHarness::fx().installed(),
+        Droid => crate::AcpHarness::droid().installed(),
         Registry(agent) => crate::acp_registry::installed(agent),
     }
 }
@@ -405,7 +411,7 @@ async fn run(
 mod tests {
     use super::*;
 
-    const IDS: [HarnessId; 11] = [
+    const IDS: [HarnessId; 12] = [
         HarnessId::ClaudeCode,
         HarnessId::Codex,
         HarnessId::Cursor,
@@ -415,6 +421,7 @@ mod tests {
         HarnessId::Hermes,
         HarnessId::Fx,
         HarnessId::Devin,
+        HarnessId::Droid,
         HarnessId::Antigravity,
         HarnessId::Mock,
     ];

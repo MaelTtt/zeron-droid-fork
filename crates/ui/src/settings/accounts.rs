@@ -179,8 +179,9 @@ pub(crate) fn usage_resets(
 }
 
 pub use zeron_proto::providers::{
-    LoginOption, PROVIDERS, add_account_label, add_option_label, keeps_one_login, login_options,
-    provider_name, provider_note, reports_usage, signs_in, switches_accounts,
+    LoginOption, PROVIDERS, add_account_label, add_option_label, droid_plan_row, droid_plan_rows,
+    droid_unsigned_plans, keeps_one_login, login_options, provider_name, provider_note,
+    reports_usage, signs_in, switches_accounts,
 };
 
 /// What the sign-in dialog says while the browser finishes — one sentence
@@ -1883,7 +1884,9 @@ impl AccountsPage {
                         .then(|| cloud_api_key(harness))
                         .flatten()
                         .filter(|_| self.api_key.is_none());
-                    let add_row = (empty || !keeps_one_login(harness)).then(|| {
+                    let add_row = ((empty || !keeps_one_login(harness))
+                        && !login_options(harness).is_empty())
+                    .then(|| {
                         div()
                             .py(px(8.0))
                             .flex()
@@ -2043,6 +2046,7 @@ impl Render for AccountsPage {
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+            HarnessId::Droid => (crate::icons::DROID_MARK, None),
             HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
             _ => (
                 crate::icons::CLAUDE_MARK,
@@ -2180,6 +2184,11 @@ impl Render for AccountsPage {
                             HarnessId::Cursor | HarnessId::Antigravity => format!(
                                 "{name} isn't connected on this device — connect it to run \
                                  {name} sessions."
+                            ),
+                            // Nothing to add here: Droid signs in on its own.
+                            HarnessId::Droid => format!(
+                                "No {name} login detected on this device — sign in with \
+                                 \u{201C}{cli}\u{201D}."
                             ),
                             _ => format!(
                                 "No {name} login detected on this device — sign in \
@@ -2505,6 +2514,18 @@ mod tests {
     }
 
     #[test]
+    fn droid_lists_its_own_login_with_usage_and_offers_no_sign_in() {
+        let droid = HarnessId::Droid;
+        assert!(signs_in(droid) && reports_usage(droid));
+        assert_eq!(provider_name(droid), "Factory Droid");
+        // One login, Droid's to change: nothing to switch, add or remove.
+        assert!(keeps_one_login(droid) && !switches_accounts(droid));
+        assert!(login_options(droid).is_empty());
+        assert!(provider_note(droid).is_some_and(|note| note.contains("/login")));
+        assert!(PROVIDERS.iter().any(|(harness, ..)| *harness == droid));
+    }
+
+    #[test]
     fn per_provider_agents_offer_one_sign_in_per_provider() {
         let opencode = login_options(HarnessId::Opencode);
         let labels: Vec<_> = opencode.iter().map(|o| o.label).collect();
@@ -2557,6 +2578,7 @@ mod tests {
                 row("grok-a", HarnessId::Grok, None, true),
             ],
             warnings: vec![],
+            ..Default::default()
         };
         let target = snapshot.accounts[1].clone();
         mark_switched(&mut snapshot, &target);
@@ -2717,6 +2739,7 @@ mod tests {
                         },
                     ],
                     warnings: vec![],
+                    ..Default::default()
                 });
                 page.login = Some(LoginFlow {
                     provider: Some("github-copilot"),
@@ -2779,6 +2802,7 @@ mod tests {
                         codex_reset_credits: None,
                     }],
                     warnings: vec![],
+                    ..Default::default()
                 });
                 page.open_api_key(HarnessId::ClaudeCode, cx);
                 page.save_api_key(cx);
@@ -2868,6 +2892,7 @@ mod tests {
                 account("c2", HarnessId::ClaudeCode, true),
             ],
             warnings: vec![],
+            ..Default::default()
         };
         let claude = provider_accounts(&snapshot, HarnessId::ClaudeCode);
         let ids: Vec<&str> = claude.iter().map(|a| a.id.as_str()).collect();
