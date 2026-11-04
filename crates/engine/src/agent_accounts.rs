@@ -14,10 +14,15 @@
 //! | OpenCode | yes    | yes    | ChatGPT loopback, Copilot code | yes   |
 //! | Pi       | yes    | yes    | ChatGPT loopback               | yes   |
 //! | Hermes   | yes    | no¹    | `hermes auth add` (device code) | yes  |
+//! | Droid    | yes    | no²    | — (`/login` inside `droid`)    | yes   |
 //!
 //! ¹ Hermes keeps every account in its own credential pool and rotates
 //! through it itself; zeron lists the pool and adds to it through Hermes'
 //! own CLI, but never rewrites it.
+//!
+//! ² Droid's one login is read, never copied or written: see [`droid`]. Its
+//! custom models that spend a Claude or ChatGPT plan are mapped to the Claude
+//! Code / Codex account that plan is, whose usage is read from that agent.
 //!
 //! The original four providers each store exactly one live login:
 //!
@@ -105,6 +110,7 @@ pub struct RelayedCallback {
     pub location: Option<String>,
 }
 
+mod droid;
 mod muse;
 mod oauth;
 mod registry_login;
@@ -220,6 +226,12 @@ pub struct AgentAccountsConfig {
     /// The user's real config root (`$XDG_CONFIG_HOME` or `~/.config`): what
     /// each zeron-kept Muse account's root mirrors (see [`muse`]).
     pub muse_config_root: PathBuf,
+    /// Droid's data dir (`~/.factory`; `$FACTORY_HOME_OVERRIDE` replaces the
+    /// home it lives in) — holds the credential store (see [`droid`]).
+    pub droid_home: PathBuf,
+    /// Whether Droid's ambient credentials count: the system keyring and
+    /// `$FACTORY_API_KEY`. Tests look at `droid_home` only.
+    pub droid_ambient: bool,
 }
 
 impl AgentAccountsConfig {
@@ -260,6 +272,10 @@ impl AgentAccountsConfig {
                 .filter(|dir| !dir.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home_dir().join(".config")),
+            droid_home: env_dir("FACTORY_HOME_OVERRIDE")
+                .unwrap_or_else(home_dir)
+                .join(".factory"),
+            droid_ambient: !crate::runner::is_cloud_platform(),
         }
     }
 
@@ -282,6 +298,8 @@ impl AgentAccountsConfig {
             pi_agent_dir: root.join("pi"),
             hermes_home: root.join("hermes"),
             muse_config_root: root.join("xdg-config"),
+            droid_home: root.join("factory"),
+            droid_ambient: false,
         }
     }
 
@@ -578,6 +596,11 @@ enum NoCredentials {
     /// The provider behind this login has no usage view zeron can read
     /// (a Hermes API key for some other vendor, Pi's Copilot session).
     Unsupported,
+    /// Droid's access token is past its expiry; Droid renews it the next
+    /// time it runs (zeron never refreshes it).
+    LoginExpired,
+    /// Droid is signed in to an account with no plan, so there are no limits.
+    NoPlan,
 }
 
 impl ProbeError {
@@ -730,6 +753,8 @@ struct ProbeEndpoints {
     openai_port: u16,
     /// The Nous portal (`/api/oauth/account`).
     nous_portal: String,
+    /// Factory's API root (`/api/billing/limits`).
+    factory_api: String,
     allow_slot_refresh: bool,
     /// Test seam: admit `http://127.0.0.1` for credential-DEFINED endpoints
     /// (Grok issuer, Devin server, …) so mock servers can stand in. Always
@@ -753,6 +778,7 @@ impl Default for ProbeEndpoints {
             openai_auth: oauth::OPENAI_AUTH.into(),
             openai_port: oauth::OPENAI_LOOPBACK_PORT,
             nous_portal: usage::NOUS_PORTAL.into(),
+            factory_api: droid::FACTORY_API.into(),
             allow_slot_refresh: true,
             allow_loopback_http: false,
         }
@@ -786,6 +812,8 @@ struct Inner {
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
     claude_credentials: Mutex<Option<CachedClaudeCredentials>>,
+    /// Droid's login as last read (see [`droid`]).
+    droid_login: Mutex<Option<droid::CachedDroidLogin>>,
     /// Callback ports of logins run for another device (see module docs).
     callback_routes: zeron_preview::login::CallbackRoutes,
     /// Who an opaque live token belongs to (Pi's Claude login, a Copilot
@@ -883,6 +911,7 @@ impl AgentAccounts {
                 inflight_probes: Mutex::new(std::collections::HashSet::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
                 claude_credentials: Mutex::new(None),
+                droid_login: Mutex::new(None),
                 callback_routes,
                 identities: Mutex::new(HashMap::new()),
                 cli_overrides: Mutex::new(HashMap::new()),
@@ -998,6 +1027,7 @@ impl AgentAccounts {
             });
         }
         let antigravity = self.detect_antigravity().await;
+        let droid = self.detect_droid().await;
 
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards). Hermes'
@@ -1025,6 +1055,16 @@ impl AgentAccounts {
         let (hermes, hermes_active) = self.hermes_slots();
         active_keys.insert(HarnessId::Hermes, hermes_active);
         providers.push((HarnessId::Hermes, hermes));
+        // Droid's login is Droid's: listed from a read, with a slot that
+        // exists only for this list (never saved), so its usage rides the
+        // same probe, cache and backoff as every other account.
+        if let Some(login) = &droid {
+            active_keys.insert(
+                HarnessId::Droid,
+                std::iter::once(login.account_key.clone()).collect(),
+            );
+            providers.push((HarnessId::Droid, vec![login.slot()]));
+        }
         if force_usage {
             let targets: Vec<(HarnessId, &Slot, bool)> = providers
                 .iter()
@@ -1058,6 +1098,19 @@ impl AgentAccounts {
                 let active = active_set.is_some_and(|keys| keys.contains(&slot.account_key));
                 let entry = usage.get(&usage_key(harness, &slot.account_key));
                 let snapshot = entry.and_then(|entry| entry.usage.as_ref());
+                // Hermes' pool is Hermes' to order, Droid's login is Droid's
+                // (see module docs): neither is zeron's to save or swap.
+                let zeron_owns = !matches!(harness, HarnessId::Hermes | HarnessId::Droid);
+                let usage_windows = snapshot
+                    .map(|usage| match harness {
+                        // The last reading can predate a window's end.
+                        HarnessId::Droid => droid::live_windows(
+                            &usage.windows,
+                            DateTime::from_timestamp_millis(now).unwrap_or_default(),
+                        ),
+                        _ => usage.windows.clone(),
+                    })
+                    .unwrap_or_default();
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -1069,9 +1122,7 @@ impl AgentAccounts {
                         .and_then(|usage| usage.plan_label.clone())
                         .or_else(|| slot.profile.plan.clone()),
                     active,
-                    usage_windows: snapshot
-                        .map(|usage| usage.windows.clone())
-                        .unwrap_or_default(),
+                    usage_windows,
                     codex_reset_credits: snapshot
                         .and_then(|usage| usage.codex_reset_credits.clone()),
                     usage_fetched_at: entry.and_then(|entry| entry.fetched_at),
@@ -1088,9 +1139,8 @@ impl AgentAccounts {
                     display_name: slot.profile.display_name.clone(),
                     organization: slot.profile.organization.clone(),
                     auth_kind: Some(slot.profile.auth_kind),
-                    // Hermes' pool is Hermes' to order (see module docs).
-                    switchable: harness != HarnessId::Hermes,
-                    saved_at: (harness != HarnessId::Hermes).then_some(slot.saved_at),
+                    switchable: zeron_owns,
+                    saved_at: zeron_owns.then_some(slot.saved_at),
                     provider: provider_group(harness, slot.store_key.as_deref()),
                 });
             }
@@ -1124,7 +1174,11 @@ impl AgentAccounts {
         if let Some(login) = antigravity {
             accounts.push(login.account());
         }
-        Ok(AgentAccountsSnapshot { accounts, warnings })
+        Ok(AgentAccountsSnapshot {
+            accounts,
+            warnings,
+            model_plans: self.droid_model_plans(),
+        })
     }
 
     // ── swap ────────────────────────────────────────────────────────────────
@@ -1146,6 +1200,12 @@ impl AgentAccounts {
             return Err(EngineError::Other(
                 "Hermes picks from its own credential pool — zeron doesn't reorder it. Use \
                  `hermes auth` to manage it."
+                    .into(),
+            ));
+        }
+        if harness == HarnessId::Droid {
+            return Err(EngineError::Other(
+                "Droid has one login, and it is Droid's to change — sign in from inside droid."
                     .into(),
             ));
         }
@@ -1490,6 +1550,11 @@ impl AgentAccounts {
                 "Hermes keeps this login in its own credential pool — remove it with \
                  `hermes auth remove`."
                     .into(),
+            ));
+        }
+        if harness == HarnessId::Droid {
+            return Err(EngineError::Other(
+                "Droid keeps this login itself — sign out from inside droid.".into(),
             ));
         }
         let _ops = self.inner.ops.lock().await;
@@ -3125,6 +3190,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
+            HarnessId::Droid => self.droid_usage(slot).await,
             HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
                 self.keyed_usage(harness, slot).await
             }
@@ -3816,6 +3882,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor",
         HarnessId::Devin => "devin",
+        HarnessId::Droid => "droid",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Fx => "fx",
@@ -4277,6 +4344,7 @@ fn usage_error_message(
         (HarnessId::Cursor, _) => "Cursor",
         (HarnessId::Grok, _) => "xAI",
         (HarnessId::Devin, _) => "Devin",
+        (HarnessId::Droid, _) => "Factory",
         (_, Some(key)) => stores::upstream_vendor(key),
         _ => "the provider",
     };
@@ -4333,6 +4401,15 @@ fn usage_error_message(
         ProbeError::NoCredentials {
             why: NoCredentials::Unsupported,
         } => "No usage view for this login".to_string(),
+        ProbeError::NoCredentials {
+            why: NoCredentials::LoginExpired,
+        } => format!(
+            "Session expired — it refreshes the next time {} runs",
+            stores::cli_name(harness)
+        ),
+        ProbeError::NoCredentials {
+            why: NoCredentials::NoPlan,
+        } => format!("No active {provider} plan"),
         ProbeError::UntrustedEndpoint => {
             "Usage skipped — this login names a server zeron doesn't recognize".to_string()
         }

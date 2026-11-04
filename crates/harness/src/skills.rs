@@ -118,6 +118,7 @@ fn project_dirs(harness: HarnessId) -> &'static [&'static str] {
         HarnessId::Grok => &[".agents/skills", ".claude/skills", ".grok/skills"],
         HarnessId::Hermes => &[".agents/skills"],
         HarnessId::Fx => &[".agents/skills", ".claude/skills", ".fx/skills"],
+        HarnessId::Droid => &[".agents/skills", ".factory/skills"],
         HarnessId::Pi => &[".agents/skills", ".pi/skills"],
         HarnessId::Devin => &[".agents/skills"],
         HarnessId::Antigravity => &[".agents/skills", ".gemini/skills"],
@@ -287,6 +288,15 @@ fn scan_root(
         for entry in children {
             let path = entry.path();
             if path.is_dir() {
+                // A skill that ships its own dependencies (a virtualenv runs
+                // to thousands of files) would otherwise spend the budget
+                // all roots share, hiding every root scanned after it.
+                if matches!(
+                    entry.file_name().to_str(),
+                    Some("node_modules" | ".git" | ".venv" | "__pycache__")
+                ) {
+                    continue;
+                }
                 pending.push((path, depth + 1));
                 continue;
             }
@@ -482,6 +492,42 @@ mod tests {
         scan_root(&repo, "", HarnessId::Pi, &mut found, &mut remaining).unwrap();
         assert_eq!(remaining, 0);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_skills_dependency_tree_does_not_hide_later_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write(
+            &home,
+            ".factory/skills/tool/SKILL.md",
+            "---\nname: tool\ndescription: Global\n---\nBody",
+        );
+        for index in 0..MAX_DISCOVERY_ENTRIES + 100 {
+            write(
+                &home,
+                &format!(".factory/skills/tool/.venv/lib/pkg-{index}.py"),
+                "x",
+            );
+            write(
+                &home,
+                &format!(".factory/skills/tool/node_modules/pkg-{index}/index.js"),
+                "x",
+            );
+        }
+        write(
+            &repo,
+            ".agents/skills/local/SKILL.md",
+            "---\nname: local\ndescription: Project\n---\nBody",
+        );
+        let names: Vec<_> = discover_at(HarnessId::Droid, &repo, &home)
+            .unwrap()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(names, ["local", "tool"]);
     }
 
     #[cfg(unix)]

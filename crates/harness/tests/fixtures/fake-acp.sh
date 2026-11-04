@@ -27,6 +27,7 @@ has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
 has "$line" '"name":"zeron"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
+INIT_LINE="$line"
 emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
 
 # ---- session new / load ----------------------------------------------------
@@ -301,6 +302,33 @@ case "$promptline" in
   { has "$ans" '"id":88' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"opt-tokio"'; } ||
     { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:elicit*)
+  # Droid's AskUser tool: a form-mode `elicitation/create`, sent only to a
+  # client that advertised `elicitation.form` (otherwise the tool is just
+  # cancelled). The schema is what droid 1.3.0 puts on the wire: a single
+  # choice, several choices, and a free-text question. The test's bridge
+  # answers Blue; Cheese + Basil (not offered, so typed); "because".
+  if ! has "$INIT_LINE" '"elicitation":{"form":{}}'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"no-form"}}'
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+    exit 0
+  fi
+  emit '{"id":91,"method":"elicitation/create","params":{"mode":"form","sessionId":"'"$SID"'","toolCallId":"q1","message":"Droid needs your answers to continue.","requestedSchema":{"type":"object","properties":{"question_1":{"type":"string","title":"Color","description":"Which color?","oneOf":[{"const":"option_0","title":"Red"},{"const":"option_1","title":"Blue"},{"const":"other","title":"Other answer"}]},"question_1_other":{"type":"string","title":"Color: Other answer","description":"Enter your answer here if you select Other answer."},"question_2":{"type":"array","title":"Toppings","description":"Which toppings?","items":{"anyOf":[{"const":"option_0","title":"Cheese"},{"const":"option_1","title":"Olives"},{"const":"other","title":"Other answer"}]},"minItems":1,"uniqueItems":true},"question_2_other":{"type":"string","title":"Toppings: Other answer","description":"Enter your answer here if you select Other answer."},"question_3":{"type":"string","title":"Reason","description":"Why?","minLength":1}},"required":["question_1","question_2","question_3"]}}}'
+  read -r ans || exit 1
+  if has "$ans" '"id":91' && has "$ans" '"action":"accept"' &&
+    has "$ans" '"question_1":"option_1"' &&
+    has "$ans" '"question_2":["option_0","other"]' &&
+    has "$ans" '"question_2_other":"Basil"' &&
+    has "$ans" '"question_3":"because"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"accepted"}}'
+  elif has "$ans" '"id":91' && has "$ans" '"action":"cancel"'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"cancelled"}}'
+  else
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong-answer"}}'
+  fi
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 

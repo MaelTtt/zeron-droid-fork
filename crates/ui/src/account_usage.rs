@@ -73,11 +73,17 @@ pub fn ring_fraction(
     used_fraction(account)
 }
 
-/// The harness's live account, when it reports usage. Pure.
-pub fn active_account(
-    snapshot: &AgentAccountsSnapshot,
+/// The account whose usage a turn of `harness` on `model` spends, when it
+/// reports usage: the harness's live login — except Droid, whose custom
+/// models may spend another plan (or none) than Factory's. Pure.
+pub fn active_account<'a>(
+    snapshot: &'a AgentAccountsSnapshot,
     harness: HarnessId,
-) -> Option<&AgentAccount> {
+    model: Option<&str>,
+) -> Option<&'a AgentAccount> {
+    if harness == HarnessId::Droid {
+        return accounts::droid_plan_row(snapshot, model);
+    }
     snapshot
         .accounts
         .iter()
@@ -282,7 +288,7 @@ impl AccountUsage {
     fn fraction(&self, cx: &gpui::App) -> Option<f32> {
         let harness = self.harness?;
         ring_fraction(
-            active_account(self.snapshot(cx)?, harness)?,
+            active_account(self.snapshot(cx)?, harness, self.model.as_deref())?,
             harness,
             self.model.as_deref(),
         )
@@ -349,17 +355,40 @@ impl AccountUsage {
         let theme = &Theme::of(cx).for_popup();
         let harness = self.harness;
         let now = chrono::Utc::now();
+        // Droid lists the plans its models can spend (Factory's, and the
+        // Claude / ChatGPT accounts its custom models are served from), each
+        // a live login of its own agent; the one in use is the plan the
+        // selected model spends.
+        let droid = harness == Some(HarnessId::Droid);
         let rows: Vec<AgentAccount> = match (harness, self.snapshot(cx)) {
+            (Some(HarnessId::Droid), Some(snapshot)) => accounts::droid_plan_rows(snapshot)
+                .into_iter()
+                .cloned()
+                .collect(),
             (Some(harness), Some(snapshot)) => accounts::provider_accounts(snapshot, harness)
                 .into_iter()
                 .cloned()
                 .collect(),
             _ => Vec::new(),
         };
-        let title = format!(
-            "{} accounts",
-            harness.map_or("Agent", accounts::provider_name)
-        );
+        let unsigned: Vec<HarnessId> = match (droid, self.snapshot(cx)) {
+            (true, Some(snapshot)) => accounts::droid_unsigned_plans(snapshot),
+            _ => Vec::new(),
+        };
+        let title = if droid {
+            "Droid plans".to_string()
+        } else {
+            format!(
+                "{} accounts",
+                harness.map_or("Agent", accounts::provider_name)
+            )
+        };
+        let droid_in_use: Option<String> = match (droid, self.snapshot(cx)) {
+            (true, Some(snapshot)) => {
+                accounts::droid_plan_row(snapshot, self.model.as_deref()).map(|a| a.id.clone())
+            }
+            _ => None,
+        };
         popover::popover_card(theme)
             .w(px(400.0))
             .flex()
@@ -372,32 +401,42 @@ impl AccountUsage {
                     .or_else(|| account.display_name.clone())
                     .unwrap_or_else(|| "Unknown account".into())
                     .into();
+                let in_use = if droid {
+                    droid_in_use.as_deref() == Some(account.id.as_str())
+                } else {
+                    account.active
+                };
                 let can_switch = !account.active && account.switchable;
-                let mut meta: Vec<gpui::AnyElement> = account
-                    .plan_label
-                    .iter()
-                    .map(|plan| {
-                        div()
-                            .child(SharedString::from(plan.clone()))
-                            .into_any_element()
-                    })
+                // Whose plan a Droid row is: its own agent's.
+                let source = droid.then(|| match account.harness {
+                    HarnessId::Droid => "Factory",
+                    other => accounts::provider_name(other),
+                });
+                let mut meta: Vec<gpui::AnyElement> = source
+                    .map(str::to_string)
+                    .into_iter()
+                    .chain(account.plan_label.clone())
+                    .map(|part| div().child(SharedString::from(part)).into_any_element())
                     .collect();
-                if account.active {
+                if in_use {
                     meta.push(
                         div()
                             .text_color(theme.accent)
                             .child(SharedString::from("In use"))
                             .into_any_element(),
                     );
-                } else if let Some(reason) = account
+                }
+                // A live login's reason shows beside its meters; Droid's
+                // rows say why they have none even while in use.
+                if let Some(reason) = account
                     .usage_error
                     .clone()
-                    .filter(|_| account.usage_windows.is_empty())
+                    .filter(|_| account.usage_windows.is_empty() && (!in_use || droid))
                 {
                     meta.push(div().child(SharedString::from(reason)).into_any_element());
                 }
                 let switch_to = account.clone();
-                popover::menu_row(theme, account.active, format!("account-usage-row-{ix}"))
+                popover::menu_row(theme, in_use, format!("account-usage-row-{ix}"))
                     .id(("account-usage-row", ix))
                     .when(!can_switch, |row| row.cursor_default())
                     .when(can_switch, |row| {
@@ -440,6 +479,17 @@ impl AccountUsage {
                                     .map(|window| render_usage_meter(window, theme)),
                             ),
                     )
+            }))
+            .children(unsigned.into_iter().map(|harness| {
+                div()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(format!(
+                        "{} isn't signed in here, so its usage can't be shown",
+                        accounts::provider_name(harness)
+                    )))
             }))
             .children(self.error.clone().map(|error| {
                 div()
@@ -595,12 +645,32 @@ mod tests {
                 account(HarnessId::Codex, false, &[0.1]),
                 account(HarnessId::Codex, true, &[0.2]),
             ],
-            warnings: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(
-            active_account(&snapshot, HarnessId::Codex).map(|a| a.id.as_str()),
+            active_account(&snapshot, HarnessId::Codex, None).map(|a| a.id.as_str()),
             Some("Codex-true")
         );
-        assert!(active_account(&snapshot, HarnessId::Cursor).is_none());
+        assert!(active_account(&snapshot, HarnessId::Cursor, None).is_none());
+    }
+
+    #[test]
+    fn droids_ring_follows_the_plan_the_model_spends() {
+        let snapshot = AgentAccountsSnapshot {
+            accounts: vec![
+                account(HarnessId::Droid, true, &[1.0]),
+                account(HarnessId::ClaudeCode, true, &[0.3]),
+            ],
+            model_plans: [("custom:Claude-0".to_string(), HarnessId::ClaudeCode)].into(),
+            ..Default::default()
+        };
+        let ring = |model: Option<&str>| {
+            active_account(&snapshot, HarnessId::Droid, model)
+                .and_then(|account| ring_fraction(account, HarnessId::Droid, model))
+        };
+        assert_eq!(ring(Some("claude-opus-5-5")), Some(1.0));
+        assert_eq!(ring(Some("custom:Claude-0")), Some(0.3));
+        // A local model spends no plan: no ring at all.
+        assert_eq!(ring(Some("custom:Local-0")), None);
     }
 }

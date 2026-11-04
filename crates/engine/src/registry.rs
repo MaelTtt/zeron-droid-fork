@@ -960,6 +960,34 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::devin().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
     );
+    // Factory Droid over ACP (`droid exec --output-format acp`), same lazy
+    // pattern: the static descriptor mirrors AcpHarness::droid() exactly. No
+    // steering extension (turn boundaries). Effort rides the advertised
+    // `thought_level` option; its `autonomy_level` mode backs both access
+    // modes (`normal` asks, `auto-high` doesn't).
+    registry.register_lazy(
+        HarnessDescriptor {
+            icon: None,
+            id: HarnessId::Droid,
+            name: "Factory Droid".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            can_install: false,
+            enabled: None,
+            access_modes: vec![AccessMode::Supervised, AccessMode::FullAccess],
+            supports_plan: false,
+        },
+        Box::new(|| zeron_harness::AcpHarness::droid().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::droid()) as Arc<dyn Harness>)),
+    );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
     // steers deliver at turn boundaries; the effort ladder applies per
@@ -1210,6 +1238,7 @@ mod tests {
                 HarnessId::Codex,
                 HarnessId::Cursor,
                 HarnessId::Devin,
+                HarnessId::Droid,
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Fx,
@@ -1250,6 +1279,24 @@ mod tests {
         assert_eq!(devin.display_name(), "Devin");
         assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
         assert!(devin.reasoning_levels().is_empty());
+        let droid = registry.resolve(HarnessId::Droid).unwrap();
+        assert_eq!(droid.id(), HarnessId::Droid);
+        assert_eq!(droid.display_name(), "Factory Droid");
+        assert_eq!(droid.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            droid.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ]
+        );
+        assert_eq!(
+            droid.access_modes(),
+            [AccessMode::Supervised, AccessMode::FullAccess]
+        );
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
         assert_eq!(hermes.display_name(), "Hermes");
@@ -1897,6 +1944,7 @@ mod gate_tests {
         for hidden in [
             HarnessId::Cursor,
             HarnessId::Devin,
+            HarnessId::Droid,
             HarnessId::Grok,
             HarnessId::Hermes,
             HarnessId::Fx,

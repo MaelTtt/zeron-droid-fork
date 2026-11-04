@@ -123,6 +123,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor-agent",
         HarnessId::Devin => "devin",
+        HarnessId::Droid => "droid",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Fx => "fx",
@@ -1833,6 +1834,7 @@ mod tests {
                         zeron_proto::AgentAccountsSnapshot {
                             accounts: vec![account],
                             warnings: Vec::new(),
+                            ..Default::default()
                         },
                     );
             })
@@ -1868,6 +1870,7 @@ fn install_visibility_and_hint_follow_target_capabilities() {
         HarnessId::Grok,
         HarnessId::Hermes,
         HarnessId::Devin,
+        HarnessId::Droid,
         HarnessId::Mock,
     ] {
         for installed in [false, true] {
