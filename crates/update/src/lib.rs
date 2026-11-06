@@ -498,14 +498,30 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
-/// The project's GitHub releases page — the advisory update strip opens this
+/// This fork's GitHub releases page — the advisory update strip opens this
 /// for unmanaged installs (source builds, hand-copied binaries), where no
 /// updater flow exists to drive.
-pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
+pub const RELEASES_PAGE: &str = "https://github.com/MaelTtt/zeron-droid-fork/releases";
 
 /// The newest release's page — the download destination offered when this
 /// installation cannot replace itself.
-pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
+pub const LATEST_RELEASE_PAGE: &str = "https://github.com/MaelTtt/zeron-droid-fork/releases/latest";
+
+/// Whether `edge_url` is one of the official edges (edge.zeron.sh, staging.zeron.sh).
+/// A build of this fork never reads releases from them: an official build
+/// replaces the fork's patches.
+fn is_official_edge(edge_url: &str) -> bool {
+    reqwest::Url::parse(edge_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "zeron.sh" || host.ends_with(".zeron.sh"))
+}
+
+/// Where this fork publishes `manifest.json` and its tarballs
+/// (.github/workflows/fork-release.yml). GitHub serves the newest release's
+/// assets under `latest/download`, so the feed needs no hosting of its own.
+const FORK_RELEASE_FEED: &str =
+    "https://github.com/MaelTtt/zeron-droid-fork/releases/latest/download";
 
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
@@ -516,6 +532,9 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     #[cfg(windows)]
     if let Some(url) = windows::release_url()? {
         return Ok(url.trim_end_matches('/').to_owned());
+    }
+    if is_official_edge(edge_url) {
+        return Ok(FORK_RELEASE_FEED.to_owned());
     }
     Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
 }
@@ -2574,6 +2593,34 @@ mod tests {
         .unwrap_err();
         assert!(error.is_timeout());
         server.abort();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_official_edge_is_read_as_this_fork_s_feed() {
+        if std::env::var_os("ZERON_RELEASES_URL").is_some() {
+            return;
+        }
+        for edge in [
+            "https://edge.zeron.sh",
+            "https://edge.zeron.sh/",
+            "https://staging.zeron.sh",
+            "https://EDGE.ZERON.SH",
+            "https://zeron.sh",
+        ] {
+            assert_eq!(release_base(edge).unwrap(), FORK_RELEASE_FEED, "{edge}");
+        }
+        assert!(!FORK_RELEASE_FEED.contains("zeronsh/"));
+        for (edge, base) in [
+            ("http://127.0.0.1:9/", "http://127.0.0.1:9/releases"),
+            ("https://notzeron.sh", "https://notzeron.sh/releases"),
+            (
+                "https://zeron.sh.example.com",
+                "https://zeron.sh.example.com/releases",
+            ),
+        ] {
+            assert_eq!(release_base(edge).unwrap(), base, "{edge}");
+        }
     }
 
     #[test]

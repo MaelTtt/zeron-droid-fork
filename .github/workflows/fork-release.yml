@@ -1,0 +1,59 @@
+name: fork-release
+
+# Publish this fork's Linux build where its updater looks for it
+# (FORK_RELEASE_FEED in crates/update/src/lib.rs): a GitHub Release holding the
+# tarball and the manifest.json the updater verifies it against.
+#
+# Trigger: push a tag `mael/v<version>` that matches the workspace version in
+# Cargo.toml, e.g. `mael/v0.2.137-mael.1`. The prefix keeps it clear of
+# release.yml, which owns `v*` tags. workflow_dispatch builds the package
+# without publishing.
+
+on:
+  push:
+    tags: ["mael/v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: package
+        run: scripts/package-linux.sh
+      - name: version guard and updater manifest
+        if: startsWith(github.ref, 'refs/tags/mael/v')
+        run: |
+          ver="${GITHUB_REF_NAME#mael/v}"
+          tarball="target/package/zeron-$ver-linux-x86_64.tar.gz"
+          test -f "$tarball" \
+            || { echo "no package for tag $GITHUB_REF_NAME: $tarball. Check the Cargo.toml version."; exit 1; }
+          sha=$(sha256sum "$tarball" | cut -d' ' -f1)
+          jq -n --arg version "$ver" --arg name "$(basename "$tarball")" --arg sha "$sha" \
+            '{version: $version, files: {($name): {sha256: $sha}}}' > manifest.json
+          cat manifest.json
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+      - name: publish release
+        if: startsWith(github.ref, 'refs/tags/mael/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Zeron $VERSION (fork)" \
+            --generate-notes \
+            "target/package/zeron-$VERSION-linux-x86_64.tar.gz" \
+            manifest.json
