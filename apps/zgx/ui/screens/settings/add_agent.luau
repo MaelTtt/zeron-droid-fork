@@ -73,6 +73,7 @@ local BUILT_IN_MARKS: { [string]: string } = {
 	codex = "openai",
 	cursor = "cursor",
 	devin = "devin",
+	droid = "droid",
 	grok = "grok",
 	opencode = "opencode",
 	pi = "pi",

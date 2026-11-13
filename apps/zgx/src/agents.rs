@@ -480,6 +480,7 @@ pub(crate) fn mark(id: &str) -> Option<&'static str> {
         "cursor" => "cursor",
         "grok" => "grok",
         "devin" => "devin",
+        "droid" => "droid",
         "opencode" => "opencode",
         "pi" => "pi",
         "hermes" => "hermes",

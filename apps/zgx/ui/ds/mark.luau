@@ -13,6 +13,7 @@ export type Name =
 	| "cursor"
 	| "grok"
 	| "devin"
+	| "droid"
 	| "opencode"
 	| "antigravity"
 	| "pi"
@@ -25,6 +26,7 @@ local FILES: { [Name]: string } = {
 	cursor = "cursor-mark",
 	grok = "grok-mark",
 	devin = "devin-mark",
+	droid = "droid-mark",
 	opencode = "opencode-mark-dark",
 	antigravity = "antigravity-mark.png",
 	pi = "pi-mark",
@@ -34,7 +36,7 @@ local FILES: { [Name]: string } = {
 
 -- Marks drawn in one ink (black, for the white tile): bare, they take the
 -- colour of the text around them instead, or they vanish on dark.
-local MONO: { [Name]: boolean } = { openai = true, grok = true, cursor = true, devin = true, hermes = true }
+local MONO: { [Name]: boolean } = { openai = true, grok = true, cursor = true, devin = true, droid = true, hermes = true }
 
 local RegistryMark = require("@self/registry_mark")
 

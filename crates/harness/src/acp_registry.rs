@@ -124,6 +124,7 @@ pub const BUILT_IN: &[(&str, &str)] = &[
     ("codex-acp", "codex"),
     ("cursor", "cursor"),
     ("devin", "devin"),
+    ("factory-droid", "droid"),
     ("grok-build", "grok"),
     ("opencode", "opencode"),
     ("pi-acp", "pi"),
@@ -1293,6 +1294,7 @@ mod tests {
     fn built_in_agents_are_known_by_their_registry_ids() {
         assert_eq!(built_in("claude-acp"), Some("claude-code"));
         assert_eq!(built_in("grok-build"), Some("grok"));
+        assert_eq!(built_in("factory-droid"), Some("droid"));
         assert_eq!(built_in("gemini"), None);
     }
 
