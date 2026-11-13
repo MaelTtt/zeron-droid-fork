@@ -5,7 +5,7 @@ name: fork-release
 # tarball and the manifest.json the updater verifies it against.
 #
 # Trigger: push a tag `mael/v<version>` that matches the workspace version in
-# Cargo.toml, e.g. `mael/v0.2.137-mael.1`. The prefix keeps it clear of
+# Cargo.toml, e.g. `mael/v0.3.4-mael.1`. The prefix keeps it clear of
 # release.yml, which owns `v*` tags. workflow_dispatch builds the package
 # without publishing.
 
@@ -33,8 +33,21 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            apps/zgx -> target
+      - name: version
+        run: echo "ZGX_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')" >> "$GITHUB_ENV"
+      # The zgx app with this commit's engine, as upstream's zgx-build.yml
+      # packages its Linux releases.
+      - name: the engine, from this commit
+        env:
+          ZERON_ENGINE_VERSION: ${{ env.ZGX_VERSION }}
+          LUAU_CXXFLAGS: -DNDEBUG
+        run: cargo build --release --locked -p zeron --bin zeron-engine
       - name: package
-        run: scripts/package-linux.sh
+        run: ZGX_ENGINE="$GITHUB_WORKSPACE/target/release/zeron-engine" scripts/package-linux.sh
       - name: version guard and updater manifest
         if: startsWith(github.ref, 'refs/tags/mael/v')
         run: |
